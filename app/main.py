@@ -1,5 +1,5 @@
 """HTTP API：上传、标注（乐观锁修订）、发布（事务内涂实）、撤回、公开读取、
-离线交付包与服务数据归档（同一数据库快照）。"""
+离线交付包、服务数据归档（同一数据库快照）、归档核验与归档恢复（空实例）。"""
 from __future__ import annotations
 
 import hashlib
@@ -15,6 +15,7 @@ from typing import Any
 from fastapi import BackgroundTasks, Body, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 
+from .archive_restore import RestorePayloadInvalid, build_restore_payload
 from .archive_verify import verify_archive_path
 from .config import Settings
 from .db import init_db, read_tx, snapshot_tx, write_tx
@@ -55,6 +56,11 @@ COVERAGE_DIFF_SNAPSHOT_HOOK: Any = None
 # 之间的钩子。生产中为空操作；并发测试借此在归档期间提交标注/发布等写入，
 # 验证归档全程对应同一个一致时点（不看到提交后的新数据）且不阻塞并发写入。
 ARCHIVE_SNAPSHOT_HOOK: Any = None
+
+# 服务数据归档恢复"空实例判定通过（仍在写锁/写事务内）-> 落盘/写库"之间
+# 的钩子。生产中为空操作；并发测试借此在判定后制造目标文件冲突、写入失败
+# 或发起并发写入，验证恢复与其他写操作的串行化及失败后的完整清理。
+RESTORE_EMPTY_CHECK_HOOK: Any = None
 
 
 def _utcnow() -> str:
@@ -169,6 +175,49 @@ def _cleanup_tempfile(path: str) -> None:
         os.unlink(path)
     except OSError:
         pass
+
+
+# 空实例判定覆盖的业务表：任一已有行都说明本实例已承载业务数据，
+# 恢复必须拒绝（batch_idempotency 也在其列——旧键残留同样是非空证据）。
+_RESTORE_BUSINESS_TABLES = (
+    "documents",
+    "annotation_rects",
+    "publications",
+    "publication_batches",
+    "batch_publications",
+    "batch_idempotency",
+    "publication_withdrawals",
+)
+
+
+def _dir_has_files(path: str) -> bool:
+    """目录下是否存在任何文件（业务文件）；目录不存在视为无文件。"""
+    if not os.path.isdir(path):
+        return False
+    for _base, _dirs, files in os.walk(path):
+        if files:
+            return True
+    return False
+
+
+def _cleanup_restore_outputs(
+    written_files: list[str], created_dirs: list[str]
+) -> None:
+    """恢复失败时清理本次已落盘的文件与新建的空目录。
+
+    只删除本次恢复自己写入/创建的路径（目标冲突处的既有文件绝不动）；
+    任何清理失败都不掩盖触发清理的原始异常。
+    """
+    for path in written_files:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    for path in reversed(created_dirs):
+        try:
+            os.rmdir(path)  # 只删空目录；已被并发写入占用则保留
+        except OSError:
+            pass
 
 
 # 原图归档相对路径的扩展名只由库内 media_type 映射，绝不取自上传文件名
@@ -1827,6 +1876,257 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # 核验不通过是正常的业务结论（HTTP 200 + valid=false），不是服务错误：
         # 调用方据 valid 与 issues 决定是否接收该归档。
         return result
+
+    # ------------- 服务数据归档恢复（空实例整体恢复，全有或全无） -------------
+
+    def _ensure_restorable_instance(conn: Any) -> None:
+        """空实例判定：业务库七张表均无行，且原图/成品目录没有任何业务文件。
+
+        本判定在 ``BEGIN IMMEDIATE`` 写事务内执行，与其他恢复及现有写操作
+        （上传登记、标注、发布、批次、撤回、打包）互斥串行：判定通过后写锁
+        一直持有到恢复提交，并发写入不能绕过判定插入业务数据。
+        """
+        non_empty_tables = [
+            t for t in _RESTORE_BUSINESS_TABLES
+            if conn.execute(f"SELECT COUNT(*) AS c FROM {t}").fetchone()["c"]
+        ]
+        non_empty_dirs = [
+            name
+            for name, path in (
+                ("originals", settings.originals_dir),
+                ("publications", settings.publications_dir),
+            )
+            if _dir_has_files(path)
+        ]
+        if non_empty_tables or non_empty_dirs:
+            _error(
+                409,
+                "instance_not_empty",
+                "restore is only allowed onto an empty instance: the business"
+                " database and the originals/publications directories must not"
+                " contain any business data",
+                non_empty_tables=non_empty_tables,
+                non_empty_dirs=non_empty_dirs,
+            )
+
+    def _write_restore_files(
+        zf: zipfile.ZipFile,
+        payload: Any,
+        written_files: list[str],
+        created_dirs: list[str],
+    ) -> None:
+        """把归档引用的原图/成品按落盘计划写入当前数据目录。
+
+        每个目标都排他创建（``xb``）：目标已存在即
+        ``409 restore_target_conflict``（绝不覆盖既有文件）；目录创建或
+        写盘失败为 ``500 restore_write_failed``。任一失败都向上传播，
+        由路由统一回滚事务并清理本次已落盘文件。
+        """
+        for item in payload.files:
+            try:
+                data = zf.read(item.archive_member)
+            except Exception as exc:  # 核验刚通过，此处失败即归档不可读
+                _error(
+                    500,
+                    "restore_archive_unreadable",
+                    f"archive member '{item.archive_member}' cannot be read"
+                    f" during restore: {exc}",
+                    path=item.archive_member,
+                )
+            parent = os.path.dirname(item.target_path)
+            if not os.path.isdir(parent):
+                try:
+                    os.makedirs(parent, exist_ok=True)
+                except OSError as exc:
+                    _error(
+                        500,
+                        "restore_write_failed",
+                        f"failed to create the directory for restored file"
+                        f" '{item.target_relpath}': {exc}",
+                        path=item.target_relpath,
+                    )
+                created_dirs.append(parent)
+            try:
+                with open(item.target_path, "xb") as f:
+                    f.write(data)
+            except FileExistsError:
+                _error(
+                    409,
+                    "restore_target_conflict",
+                    f"target file for '{item.target_relpath}' already exists on"
+                    " this instance; restore aborted without overwriting it",
+                    path=item.target_relpath,
+                )
+            except OSError as exc:
+                _error(
+                    500,
+                    "restore_write_failed",
+                    f"failed to write restored file '{item.target_relpath}':"
+                    f" {exc}",
+                    path=item.target_relpath,
+                )
+            written_files.append(item.target_path)
+
+    def _insert_restore_rows(conn: Any, payload: Any) -> None:
+        """把归档记录整体写库：ID、版本、摘要与时间原样保留。
+
+        批次幂等键（batch_idempotency）不在归档内容中，**不推断恢复**——
+        旧键在恢复后的实例上不再有效，重放旧键按新请求处理。
+        """
+        for d in payload.documents:
+            conn.execute(
+                "INSERT INTO documents (id, filename, media_type, original_path,"
+                " original_sha256, width, height, annotation_revision, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    d["id"], d["filename"], d["media_type"], d["original_path"],
+                    d["original_sha256"], d["width"], d["height"],
+                    d["annotation_revision"], d["created_at"],
+                ),
+            )
+        for row in payload.annotation_rects:
+            conn.execute(
+                "INSERT INTO annotation_rects"
+                " (doc_id, revision, idx, x, y, w, h, reason)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                row,
+            )
+        for p in payload.publications:
+            conn.execute(
+                "INSERT INTO publications (doc_id, version, annotation_revision,"
+                " original_sha256, output_sha256, output_path, created_at,"
+                " batch_id, publish_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    p["doc_id"], p["version"], p["annotation_revision"],
+                    p["original_sha256"], p["output_sha256"], p["output_path"],
+                    p["created_at"], p["batch_id"], p["publish_at"],
+                ),
+            )
+        for b in payload.batches:
+            conn.execute(
+                "INSERT INTO publication_batches (id, created_at, publish_at)"
+                " VALUES (?,?,?)",
+                (b["id"], b["created_at"], b["publish_at"]),
+            )
+        for m in payload.batch_members:
+            conn.execute(
+                "INSERT INTO batch_publications (batch_id, position, doc_id,"
+                " version, annotation_revision, original_sha256, output_sha256)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (
+                    m["batch_id"], m["position"], m["doc_id"], m["version"],
+                    m["annotation_revision"], m["original_sha256"],
+                    m["output_sha256"],
+                ),
+            )
+        for w in payload.withdrawals:
+            conn.execute(
+                "INSERT INTO publication_withdrawals"
+                " (doc_id, version, reason, withdrawn_at) VALUES (?,?,?,?)",
+                (w["doc_id"], w["version"], w["reason"], w["withdrawn_at"]),
+            )
+
+    @app.post("/service-data-archives/restore", status_code=201)
+    def restore_service_data_archive(file: UploadFile = File(...)) -> dict:
+        """把本服务导出的数据归档 ZIP 整体恢复到**空实例**（运维请求）。
+
+        请求：``multipart/form-data``，字段名 ``file``，内容为本服务
+        ``POST /service-data-archives`` 生成的归档 ZIP。上传先流式落入
+        **系统临时目录**的临时文件（恢复结束即删），随后按**现有归档核验
+        规则**（同 ``POST /service-data-archives/verify``）检查全部成员与
+        记录关系，核验不通过即 ``400 invalid_archive``（附 ``issues``）。
+
+        仅当**业务库为空**（七张业务表均无行）且**原图/成品目录没有任何
+        业务文件**时才允许恢复；该判定与文件落盘、记录写入都在**同一个
+        ``BEGIN IMMEDIATE`` 写事务**内完成，与其他恢复及现有写操作互斥
+        串行——并发写入不能绕过空实例判定，两个并发恢复至多一个成功。
+
+        恢复内容：文档、各修订标注、发布与批次关系、撤回记录整体写库
+        （**保留 ID、版本、摘要与时间**，本机文件路径按当前数据目录重建），
+        归档引用的原图与成品以**排他创建**写入当前数据目录（目标已存在即
+        ``409 restore_target_conflict``，绝不覆盖）。``batch_idempotency``
+        不在归档中，**旧批次幂等键不推断恢复**。
+
+        **全有或全无**：无效归档、非空实例、目标冲突或写入失败都明确拒绝，
+        事务回滚且本次已落盘文件全部清理，不留下可查询的部分记录或本次
+        文件。成功后返回各类恢复计数；既有查询与公开接口即按恢复记录工作：
+        定时公开版本到点前仍 404、已撤回版本仍 410。
+        """
+        # 流式落系统临时文件，避免大归档整体驻留内存；绝不直接写到 DATA_DIR。
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix="svc-restore-", suffix=".zip")
+        total = 0
+        too_large = False
+        try:
+            with os.fdopen(tmp_fd, "wb") as out:
+                while True:
+                    chunk = file.file.read(1 << 20)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > settings.max_restore_bytes:
+                        too_large = True
+                        break
+                    out.write(chunk)
+            if too_large:
+                _error(
+                    413,
+                    "payload_too_large",
+                    f"archive is larger than the restore limit of"
+                    f" {settings.max_restore_bytes} bytes",
+                )
+            if total == 0:
+                _error(400, "empty_upload", "uploaded archive file is empty")
+
+            # 先按现有归档核验规则检查全部成员与记录关系；不通过即拒绝，
+            # 不触碰数据库与数据目录。
+            verdict = verify_archive_path(tmp_path)
+            if not verdict["valid"]:
+                _error(
+                    400,
+                    "invalid_archive",
+                    "the uploaded archive failed archive integrity"
+                    " verification and cannot be restored",
+                    issues=verdict["issues"],
+                )
+
+            with zipfile.ZipFile(tmp_path) as zf:
+                try:
+                    payload = build_restore_payload(zf, settings)
+                except RestorePayloadInvalid as exc:
+                    _error(
+                        400,
+                        "invalid_archive",
+                        "the uploaded archive cannot be restored:"
+                        f" {exc.issues[0]['message']}",
+                        issues=exc.issues,
+                    )
+
+                written_files: list[str] = []
+                created_dirs: list[str] = []
+                try:
+                    # 空实例判定、文件落盘与记录写入同在同一个写事务内：
+                    # 与其他恢复及现有写操作互斥串行，任一失败整体回滚。
+                    with write_tx(settings.db_path) as conn:
+                        _ensure_restorable_instance(conn)
+                        # 测试钩子：空实例判定已通过、尚未落盘/写库。
+                        if RESTORE_EMPTY_CHECK_HOOK is not None:
+                            RESTORE_EMPTY_CHECK_HOOK()
+                        _write_restore_files(
+                            zf, payload, written_files, created_dirs
+                        )
+                        _insert_restore_rows(conn, payload)
+                except Exception:
+                    # 事务已回滚（不留任何可查询的部分记录），
+                    # 本次已落盘的文件与新建空目录一并清理。
+                    _cleanup_restore_outputs(written_files, created_dirs)
+                    raise
+        finally:
+            _cleanup_tempfile(tmp_path)
+        return {
+            "restored": True,
+            "restored_at": _utcnow(),
+            "counts": payload.counts,
+        }
 
     return app
 
