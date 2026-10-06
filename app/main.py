@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import tempfile
 import uuid
 import zipfile
@@ -15,6 +16,7 @@ from typing import Any
 from fastapi import BackgroundTasks, Body, FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 
+from .archive_restore import load_restore_plan
 from .archive_verify import verify_archive_path
 from .config import Settings
 from .db import init_db, read_tx, snapshot_tx, write_tx
@@ -55,6 +57,11 @@ COVERAGE_DIFF_SNAPSHOT_HOOK: Any = None
 # 之间的钩子。生产中为空操作；并发测试借此在归档期间提交标注/发布等写入，
 # 验证归档全程对应同一个一致时点（不看到提交后的新数据）且不阻塞并发写入。
 ARCHIVE_SNAPSHOT_HOOK: Any = None
+
+# 归档恢复"空实例判定通过（写锁/写事务内）-> 文件落盘与记录写入"之间的钩子。
+# 生产中为空操作；并发测试借此在判定后插入并发写入或另一次恢复，验证空实例
+# 判定与现有写操作、其他恢复之间的串行顺序。
+RESTORE_EMPTY_CHECK_HOOK: Any = None
 
 
 def _utcnow() -> str:
@@ -1827,6 +1834,315 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # 核验不通过是正常的业务结论（HTTP 200 + valid=false），不是服务错误：
         # 调用方据 valid 与 issues 决定是否接收该归档。
         return result
+
+    # ------------- 服务数据归档恢复（空实例整体恢复，判定与写入同一写事务） -------------
+
+    def _ensure_restorable_empty_instance(conn: Any) -> None:
+        """空实例判定：业务表全空，且原图/成品目录没有任何业务文件。
+
+        必须在写事务（写锁）内调用：与现有写操作及其他恢复串行，判定结果
+        不会被并发写入绕过。
+        """
+        for table in (
+            "documents", "annotation_rects", "publications",
+            "publication_batches", "batch_publications",
+            "batch_idempotency", "publication_withdrawals",
+        ):
+            # 表名全部来自上方字面量，不存在注入面
+            rows = conn.execute(
+                f"SELECT COUNT(*) AS c FROM {table}"
+            ).fetchone()["c"]
+            if rows:
+                _error(
+                    409,
+                    "instance_not_empty",
+                    f"restore requires an empty instance: table '{table}'"
+                    f" already contains {rows} row(s)",
+                    table=table,
+                    rows=rows,
+                )
+        for label, path in (
+            ("originals", settings.originals_dir),
+            ("publications", settings.publications_dir),
+        ):
+            try:
+                entries = os.listdir(path)
+            except FileNotFoundError:
+                entries = []
+            if entries:
+                _error(
+                    409,
+                    "instance_not_empty",
+                    f"restore requires an empty instance: the {label}"
+                    f" directory already contains {len(entries)} file(s)",
+                    directory=label,
+                    file_count=len(entries),
+                )
+
+    def _write_restore_files(
+        zip_path: str,
+        plan: dict,
+        written_paths: list[str],
+        created_dirs: list[str],
+    ) -> None:
+        """把归档引用的原图/成品按当前 DATA_DIR 重建路径落盘。
+
+        逐成员以 ``xb`` 独占创建：目标已存在即 409 冲突（绝不覆盖既有文件）；
+        其它 IO 失败为 500。已写路径与新建目录登记到参数列表，供调用方在
+        失败时整体清理。
+        """
+        with zipfile.ZipFile(zip_path) as zf:
+            for item in plan["files"]:
+                relpath = item["path"]  # 核验已保证为合法相对路径
+                ident: dict[str, Any] = {"path": relpath, "doc_id": item["doc_id"]}
+                if "version" in item:
+                    ident["version"] = item["version"]
+                target = os.path.abspath(os.path.join(settings.data_dir, relpath))
+                parent = os.path.dirname(target)
+                if not os.path.isdir(parent):
+                    try:
+                        os.makedirs(parent, exist_ok=True)
+                    except OSError as exc:
+                        _error(
+                            500,
+                            "restore_file_write_failed",
+                            f"failed to create the directory for restored file"
+                            f" '{relpath}': {exc}",
+                            **ident,
+                        )
+                    created_dirs.append(parent)
+                data = zf.read(relpath)
+                try:
+                    with open(target, "xb") as f:
+                        f.write(data)
+                except FileExistsError:
+                    _error(
+                        409,
+                        "restore_target_conflict",
+                        f"target file for archive member '{relpath}' already"
+                        " exists; refusing to overwrite it",
+                        **ident,
+                    )
+                except OSError as exc:
+                    _error(
+                        500,
+                        "restore_file_write_failed",
+                        f"failed to write restored file '{relpath}': {exc}",
+                        **ident,
+                    )
+                written_paths.append(target)
+
+    def _insert_restore_records(conn: Any, plan: dict) -> None:
+        """把归档记录整体写入业务库。
+
+        ID、版本号、摘要与各类时间原样保留；``original_path``/``output_path``
+        按当前 ``DATA_DIR`` 重建为本机绝对路径。批次成员行的冗余字段
+        （标注修订号、原图/成品摘要）取自对应发布记录（核验已保证一致）。
+        归档不包含批次幂等键：``batch_idempotency`` 保持为空，**不推断恢复**。
+        """
+        try:
+            for d in plan["documents"]:
+                conn.execute(
+                    "INSERT INTO documents (id, filename, media_type, original_path,"
+                    " original_sha256, width, height, annotation_revision, created_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?)",
+                    (
+                        d["doc_id"],
+                        d["filename"],
+                        d["media_type"],
+                        os.path.abspath(
+                            os.path.join(settings.data_dir, d["original_file"])
+                        ),
+                        d["original_sha256"],
+                        d["width"],
+                        d["height"],
+                        d["annotation_revision"],
+                        d["created_at"],
+                    ),
+                )
+            for ad in plan["annotation_docs"]:
+                for rev in ad["revisions"]:
+                    for idx, r in enumerate(rev["rects"]):
+                        conn.execute(
+                            "INSERT INTO annotation_rects"
+                            " (doc_id, revision, idx, x, y, w, h, reason)"
+                            " VALUES (?,?,?,?,?,?,?,?)",
+                            (
+                                ad["doc_id"], rev["revision"], idx,
+                                r["x"], r["y"], r["w"], r["h"], r["reason"],
+                            ),
+                        )
+            pubs_by_pair: dict[tuple[str, int], Any] = {}
+            for p in plan["publications"]:
+                conn.execute(
+                    "INSERT INTO publications (doc_id, version, annotation_revision,"
+                    " original_sha256, output_sha256, output_path, created_at,"
+                    " batch_id, publish_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (
+                        p["doc_id"],
+                        p["version"],
+                        p["annotation_revision"],
+                        p["original_sha256"],
+                        p["output_sha256"],
+                        os.path.abspath(
+                            os.path.join(settings.data_dir, p["output_file"])
+                        ),
+                        p["created_at"],
+                        p["batch_id"],
+                        p["publish_at"],
+                    ),
+                )
+                pubs_by_pair[(p["doc_id"], p["version"])] = p
+            for b in plan["batches"]:
+                conn.execute(
+                    "INSERT INTO publication_batches (id, created_at, publish_at)"
+                    " VALUES (?,?,?)",
+                    (b["batch_id"], b["created_at"], b["publish_at"]),
+                )
+                for m in b["documents"]:
+                    p = pubs_by_pair[(m["doc_id"], m["version"])]
+                    conn.execute(
+                        "INSERT INTO batch_publications (batch_id, position, doc_id,"
+                        " version, annotation_revision, original_sha256,"
+                        " output_sha256) VALUES (?,?,?,?,?,?,?)",
+                        (
+                            b["batch_id"],
+                            m["position"],
+                            m["doc_id"],
+                            m["version"],
+                            p["annotation_revision"],
+                            p["original_sha256"],
+                            p["output_sha256"],
+                        ),
+                    )
+            for w in plan["withdrawals"]:
+                conn.execute(
+                    "INSERT INTO publication_withdrawals"
+                    " (doc_id, version, reason, withdrawn_at) VALUES (?,?,?,?)",
+                    (w["doc_id"], w["version"], w["reason"], w["withdrawn_at"]),
+                )
+        except sqlite3.Error as exc:
+            _error(
+                500,
+                "restore_write_failed",
+                f"failed to write restored records into the database: {exc}",
+            )
+
+    @app.post("/service-data-archives/restore")
+    def restore_service_data_archive(file: UploadFile = File(...)) -> dict:
+        """把本服务导出的归档 ZIP 整体恢复到**空实例**（运维请求）。
+
+        请求：``multipart/form-data``，字段名 ``file``，内容为本服务
+        ``POST /service-data-archives`` 生成的归档 ZIP。
+
+        处理顺序（任一环节失败都明确拒绝，不留可查询的部分记录或本次文件）：
+
+        1. 上传内容流式写入**系统临时目录**（处理完毕即删；空文件 400、
+           超过 ``MAX_RESTORE_MB`` 413）；
+        2. 按与 ``POST /service-data-archives/verify`` 完全相同的规则核验
+           全部成员与记录关系，任一问题即 400 ``invalid_archive``
+           （附核验 ``issues``）；
+        3. 在**同一个** ``BEGIN IMMEDIATE`` 写事务内依次完成：空实例判定
+           （业务表全空且 originals/ 与 publications/ 无业务文件，否则
+           409 ``instance_not_empty``）-> 归档文件落盘（``xb`` 独占创建，
+           目标已存在即 409 ``restore_target_conflict``，绝不覆盖）->
+           全部记录写入。判定与写入和现有写操作、其他恢复被写锁串行：
+           并发写入要么先提交（本恢复看到非空而拒绝），要么等本恢复提交
+           后再执行，**无法绕过空实例判定**；
+        4. 写盘或写库失败（500 ``restore_file_write_failed`` /
+           ``restore_write_failed``）时事务整体回滚，并删除本次已落盘的
+           文件与新建目录。
+
+        恢复内容：文档、各修订标注、发布与批次关系、撤回记录及对应原图/
+        成品文件；ID、版本号、摘要与各类时间原样保留，本机文件路径按当前
+        ``DATA_DIR`` 重建。归档不包含批次幂等键，``batch_idempotency``
+        **不推断恢复**（旧键重放按新键处理）。成功返回各类恢复计数；
+        既有查询与公开接口随即按恢复记录及原 ``publish_at``/撤回规则工作。
+        """
+        # 流式落系统临时文件，避免大归档整体驻留内存；绝不直接写 DATA_DIR。
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix="svc-restore-", suffix=".zip")
+        total = 0
+        too_large = False
+        try:
+            file.file.seek(0)  # 同步端点直接读已暂存的上传流；防御性归零
+            with os.fdopen(tmp_fd, "wb") as out:
+                while True:
+                    chunk = file.file.read(1 << 20)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > settings.max_restore_bytes:
+                        too_large = True
+                        break
+                    out.write(chunk)
+            if too_large:
+                _error(
+                    413,
+                    "payload_too_large",
+                    f"archive is larger than the restore limit of"
+                    f" {settings.max_restore_bytes} bytes",
+                )
+            if total == 0:
+                _error(400, "empty_upload", "uploaded archive file is empty")
+
+            # 先按现有归档核验规则检查全部成员与记录关系（纯只读核验）。
+            verification = verify_archive_path(tmp_path)
+            if not verification["valid"]:
+                _error(
+                    400,
+                    "invalid_archive",
+                    "the uploaded archive failed archive verification and"
+                    " cannot be restored",
+                    issues=verification["issues"],
+                )
+
+            plan = load_restore_plan(tmp_path)
+
+            # 空实例判定、文件落盘与记录写入在同一个写事务内：与现有写操作
+            # 及其他恢复互斥串行；任何失败整体回滚并清理本次已落盘文件。
+            written_paths: list[str] = []
+            created_dirs: list[str] = []
+            try:
+                with write_tx(settings.db_path) as conn:
+                    _ensure_restorable_empty_instance(conn)
+                    # 测试钩子：空实例判定通过，尚未落盘/写记录。
+                    if RESTORE_EMPTY_CHECK_HOOK is not None:
+                        RESTORE_EMPTY_CHECK_HOOK()
+                    _write_restore_files(tmp_path, plan, written_paths, created_dirs)
+                    _insert_restore_records(conn, plan)
+            except Exception:
+                # 事务已整体回滚（不留可查询的部分记录）；清理本次落盘内容。
+                for path in written_paths:
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+                for path in reversed(created_dirs):
+                    try:
+                        os.rmdir(path)
+                    except OSError:
+                        pass
+                raise
+        finally:
+            _cleanup_tempfile(tmp_path)
+
+        return {
+            "restored": True,
+            "restored_at": _utcnow(),
+            "record_counts": {
+                "documents": len(plan["documents"]),
+                "annotation_revisions": sum(
+                    len(ad["revisions"]) for ad in plan["annotation_docs"]
+                ),
+                "publications": len(plan["publications"]),
+                "publication_batches": len(plan["batches"]),
+                "withdrawals": len(plan["withdrawals"]),
+            },
+            "file_counts": {
+                "originals": len(plan["documents"]),
+                "publications": len(plan["publications"]),
+            },
+        }
 
     return app
 

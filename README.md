@@ -51,6 +51,7 @@ python -m pytest tests/ -q
 | `DATA_DIR`      | `./data`（容器内 `/data`） | SQLite 库、原图、发布成品的存放根目录 |
 | `MAX_UPLOAD_MB` | `25`     | 单个上传文件大小上限（MB）                 |
 | `MAX_VERIFY_MB` | `512`    | 归档核验上传 ZIP 大小上限（MB）；核验只读临时文件、不解压到 `DATA_DIR` |
+| `MAX_RESTORE_MB` | `512`   | 归档恢复上传 ZIP 大小上限（MB）；恢复先落系统临时目录，核验通过才写入 `DATA_DIR` |
 
 监听地址/端口通过 uvicorn 参数（`--host`/`--port`）或 Compose 的 `ports` 映射调整。
 首次启动时应用自动建目录、建表（初始化无需手工步骤）。
@@ -76,6 +77,7 @@ python -m pytest tests/ -q
 | POST | `/publication-packages` | **离线交付包**：按请求顺序提交 2～20 个互不重复的 `(doc_id, version)`，成功返回 ZIP（各版 PNG + `manifest.json` 清单）；任一项未知/未到公开时间/已撤回即整包拒绝 |
 | POST | `/service-data-archives` | **服务数据归档（运维）**：无请求体，返回同一数据库快照的 ZIP——文档/标注/发布/撤回记录 + 该快照引用的原图与发布成品（相对路径）+ `manifest.json`（SHA-256、文档/版本标识、文件数）；任一引用文件缺失或摘要不符即整单拒绝 |
 | POST | `/service-data-archives/verify` | **归档核验（运维交接前，纯只读）**：上传归档 ZIP（multipart 字段 `file`），核对成员名唯一且均为规定相对路径、清单与实际成员一一对应、计数与 SHA-256 匹配，以及文档↔连续标注修订↔发布版本↔批次成员顺序↔撤回记录的引用关系与原图/成品摘要；通过返回各类记录计数，失败返回可定位原因并整体判失败。**不解压到服务数据目录、不改写任何现有记录** |
+| POST | `/service-data-archives/restore` | **归档恢复（运维，空实例整体恢复）**：上传归档 ZIP（multipart 字段 `file`），先按核验同一口径检查全部成员与记录关系，再在**一个写事务**内完成空实例判定（业务库为空且原图/成品目录无业务文件）、文件落盘（独占创建、绝不覆盖）与全部记录写入；ID/版本/摘要/时间保留，本机路径按当前 `DATA_DIR` 重建；成功返回各类恢复计数。无效归档 400、非空实例 409、目标冲突 409、写入失败 500，均不留部分记录或本次文件 |
 
 ## 调用示例（curl）
 
@@ -748,6 +750,67 @@ curl -sS -X POST "$BASE/service-data-archives/verify" \
 `BASE=http://localhost:8000 bash examples/demo_archive_verify.sh`。
 
 
+## 服务数据归档恢复（空实例整体恢复，串行判定）
+
+运维需要把已核验的归档 ZIP 恢复到**新实例**时，调用
+`POST /service-data-archives/restore`。请求为 `multipart/form-data`，字段名
+`file`，内容即 `POST /service-data-archives` 生成的归档 ZIP。处理顺序：
+
+1. **上传落系统临时目录**：流式写入（空文件 `400 empty_upload`、超过
+   `MAX_RESTORE_MB`（默认 512MB）`413 payload_too_large`），处理完毕即删，
+   绝不直接向 `DATA_DIR` 解压；
+2. **先核验**：按与 `POST /service-data-archives/verify` **完全相同的规则**
+   检查全部成员与记录关系，任一问题即 `400 invalid_archive`（响应附核验
+   `issues`，可定位）；
+3. **同一写事务内恢复**：在一个 `BEGIN IMMEDIATE` 写事务内依次完成——
+   - **空实例判定**：全部业务表为空，且 `originals/` 与 `publications/`
+     目录没有任何业务文件，否则 `409 instance_not_empty`；
+   - **文件落盘**：归档引用的原图/成品按当前 `DATA_DIR` 重建本机路径，
+     以独占创建（`xb`）写入——目标已存在即 `409 restore_target_conflict`，
+     **绝不覆盖**既有文件；
+   - **记录写入**：文档、各修订标注、发布与批次关系、撤回记录整体插入，
+     **ID、版本号、摘要与各类时间原样保留**。
+4. **失败整体回滚**：写盘/写库失败（`500 restore_file_write_failed` /
+   `restore_write_failed`）或上述任一拒绝，事务整体回滚并删除本次已落盘的
+   文件与新建目录——**不留可查询的部分记录或本次文件**。
+
+```bash
+# 目标实例（空实例）
+curl -sS -X POST "$TARGET/service-data-archives/restore" \
+  -F "file=@archive.zip;type=application/zip"
+# -> 200
+# {
+#   "restored": true,
+#   "restored_at": "2026-10-06T…+00:00",
+#   "record_counts": {"documents": 2, "annotation_revisions": 4,
+#     "publications": 4, "publication_batches": 1, "withdrawals": 1},
+#   "file_counts": {"originals": 2, "publications": 4}
+# }
+```
+
+- **串行判定**：空实例判定与文件/记录写入在同一个写事务（写锁）内，与现有
+  写操作（上传、标注、发布、撤回、打包）及其他恢复互斥串行——并发写入要么
+  先提交（本恢复看到非空而 409），要么等本恢复提交后再执行，**无法绕过空
+  实例判定**；两次并发恢复恰好一个成功。
+- **幂等键不推断恢复**：归档不包含批次幂等键，`batch_idempotency` 在目标
+  实例保持为空；旧键重放按**新键**处理（不会命中旧批次的重放响应）。
+- **恢复后即刻可用**：既有查询与公开接口按恢复记录工作——定时公开版本到点
+  前 404、到点自动可读，撤回版本 410，批次清单按原顺序返回；后续标注修订号、
+  发布版本号在恢复值上顺延。
+- 恢复是**一次性**的：成功后实例即非空，再次恢复同一归档返回
+  `409 instance_not_empty`。
+
+端到端示例（源实例取归档 -> 空目标实例核验并恢复 -> 既有接口验证 ->
+非空/篡改拒绝演示，需两个实例）：
+
+```bash
+# 终端1：DATA_DIR=./data-src uvicorn app.main:app --port 8000
+# 终端2：DATA_DIR=./data-dst uvicorn app.main:app --port 8001
+BASE=http://localhost:8000 TARGET_BASE=http://localhost:8001 \
+  bash examples/demo_restore.sh
+```
+
+
 ## 错误响应
 
 统一格式：`{"detail": {"code": "...", "message": "..."}}`
@@ -791,6 +854,11 @@ curl -sS -X POST "$BASE/service-data-archives/verify" \
 | 400 | `empty_upload` | 归档核验上传空文件（`/service-data-archives/verify`） |
 | 413 | `payload_too_large` | 归档核验上传超过 `MAX_VERIFY_MB`（默认 512MB） |
 | 200 | （核验业务结论，`valid:false`） | 归档不可信时 HTTP 仍为 200，原因在 `issues[]`：`not_a_zip`、`duplicate_zip_member`、`illegal_member_path`、`unexpected_directory_member`、`unexpected_member`、`missing_manifest`、`missing_record_file`、`manifest_invalid_json`、`manifest_invalid_structure`、`manifest_invalid_entry`、`manifest_member_missing`、`member_not_in_manifest`、`duplicate_manifest_entry`、`manifest_lists_itself`、`manifest_sha256_mismatch`、`manifest_identity_mismatch`、`manifest_file_count_invalid`、`manifest_file_count_mismatch`、`archive_member_unreadable`、`record_invalid_json`、`record_invalid_structure`、`record_invalid_entry`、`record_count_mismatch`、`duplicate_record_entry`、`record_relation_conflict`、`record_digest_conflict`、`referenced_file_missing`、`unreferenced_archive_file`（均附 `path`/`doc_id`/`version`/`field` 等定位字段） |
+| 400 | `invalid_archive` | 归档恢复的上传内容未通过归档核验（`/service-data-archives/restore`，附核验 `issues`） |
+| 409 | `instance_not_empty` | 归档恢复目标实例非空：业务表已有记录或原图/成品目录已有业务文件（附 `table`/`rows` 或 `directory`/`file_count`） |
+| 409 | `restore_target_conflict` | 归档恢复的目标文件已存在（附 `path`/`doc_id`/`version`，绝不覆盖） |
+| 500 | `restore_file_write_failed` | 归档恢复文件落盘失败（附 `path`/`doc_id`；整体回滚并清理本次文件） |
+| 500 | `restore_write_failed` | 归档恢复记录写库失败（整体回滚并清理本次文件） |
 | 413 | `payload_too_large` | 超过上传大小上限 |
 | 415 | `unsupported_media_type` | 非 PNG/JPEG（如 GIF） |
 
@@ -865,6 +933,19 @@ curl -sS -X POST "$BASE/service-data-archives/verify" \
   才生效，本次交付完成；包内 PNG 文件名只由请求位置、服务端文档 ID 与版本号
   生成，不取自上传文件名，`manifest.json` 按请求顺序记录文档 ID、版本号、
   成品 SHA-256、遮盖数与包内文件名。
+- **服务数据归档恢复**：`POST /service-data-archives/restore` 先把上传 ZIP
+  流式落到系统临时目录并按核验端点**同一口径**检查全部成员与记录关系（失败
+  即 `400 invalid_archive`，不产生任何副作用）；随后在**一个** `BEGIN
+  IMMEDIATE` 写事务内完成空实例判定（业务表全空且 `originals/`、
+  `publications/` 无业务文件）、归档文件按当前 `DATA_DIR` 重建路径落盘
+  （`xb` 独占创建，目标已存在即 `409 restore_target_conflict`，绝不覆盖）
+  与全部记录写入（ID、版本、摘要、时间原样保留；批次成员冗余字段取自对应
+  发布记录）。判定与写入和现有写操作、其他恢复被写锁串行：并发写入要么先
+  提交（恢复看到非空而 `409 instance_not_empty`），要么等恢复提交后执行，
+  **无法绕过空实例判定**。任何失败整体回滚并删除本次已落盘文件与新建目录，
+  不留可查询的部分记录或本次文件。归档不含批次幂等键，`batch_idempotency`
+  **不推断恢复**（旧键重放按新键处理）；恢复后既有查询与公开接口按恢复记录
+  及原 `publish_at`/撤回规则工作，修订号/版本号在恢复值上顺延。
 - **服务数据归档**：`POST /service-data-archives` 无请求体、纯只读。文档、
   各修订标注、发布、批次与撤回记录全部在**一个只读快照事务**（延迟 `BEGIN`
   的 WAL 读快照）中读取，归档期间并发提交的写入对本次不可见，因此归档**只
@@ -889,6 +970,7 @@ app/
   models.py   # 请求体模型（含批次、迁移、遮盖比较请求）
   config.py   # 环境变量配置
   archive_verify.py  # 服务数据归档 ZIP 的交接前核验（纯只读，不落盘）
+  archive_restore.py # 归档恢复计划解析（纯解析，无副作用；写库/落盘在路由写事务内）
 tests/test_api.py    # 16 个用例：含 EXIF、乐观锁、错误码、不可变性、并发一致性
 tests/test_batch.py  # 12 个用例：批次成功/顺序、数量与重复、文档缺失/修订过期/
                      #   原图不可读/写盘失败的整批回滚、版本交错、不可变性、并发
@@ -915,6 +997,11 @@ tests/test_archive_verify.py # 40 个用例：有效归档（含空库/JPEG/多�
                              #   连续/越界、发布版本连续/修订悬空、批次顺序与双向引用、
                              #   撤回悬空/标记冲突、摘要冲突、游离文件；核验不解压不
                              #   改写服务数据
+tests/test_restore.py        # 18 个用例：空实例整体恢复（记录/文件/路径重建/计数）、
+                             #   公开接口按恢复记录工作（定时 404→200、撤回 410）、
+                             #   恢复后业务顺延、幂等键不推断恢复、空归档、无效归档/
+                             #   非空实例/目标冲突/写盘写库失败整体回滚不留痕、
+                             #   并发恢复与并发写入串行判定、临时文件清理
 tests/test_migration.py      # 20 个用例：缩放取整（floor/ceil/独立宽高）、成功
                              #   迁移与修订号 +1、原因与顺序、源与历史/发布版
                              #   不变、数量/重复/源混入目标/缺失/修订过期/源为空
@@ -932,12 +1019,44 @@ examples/demo_withdrawal.sh  # 版本撤回端到端 curl 示例
 examples/demo_package.sh     # 离线交付包端到端 curl 示例
 examples/demo_archive.sh     # 服务数据归档端到端 curl 示例
 examples/demo_archive_verify.sh  # 归档核验（有效计数 + 篡改后可定位失败）端到端示例
+examples/demo_restore.sh     # 归档恢复（源实例取归档 -> 空目标实例恢复 -> 拒绝演示）端到端示例
 examples/demo_migration.sh   # 遮盖方案迁移端到端 curl 示例
 examples/demo_coverage_diff.sh  # 重发前遮盖范围比较端到端 curl 示例
 Dockerfile / docker-compose.yml
 ```
 
-## 本轮变动（服务数据归档核验）
+## 本轮变动（服务数据归档恢复）
+
+- 新增 `POST /service-data-archives/restore`：运维把本服务导出的归档 ZIP
+  整体恢复到**空实例**（`multipart/form-data`，字段名 `file`）。上传先流式
+  落**系统临时目录**（空文件 `400 empty_upload`、超过 `MAX_RESTORE_MB`
+  （默认 512MB）`413 payload_too_large`、处理完毕即删），再按与核验端点
+  **完全相同的规则**检查全部成员与记录关系，任一问题即
+  `400 invalid_archive`（附核验 `issues`）。
+- **空实例整体恢复、串行判定**：空实例判定（业务表全空且 `originals/`、
+  `publications/` 无业务文件，否则 `409 instance_not_empty`）、归档文件按
+  当前 `DATA_DIR` 重建路径落盘（`xb` 独占创建，目标已存在即
+  `409 restore_target_conflict`，绝不覆盖）与全部记录写入在**同一个**
+  `BEGIN IMMEDIATE` 写事务内完成，与现有写操作及其他恢复互斥串行——
+  并发写入**无法绕过空实例判定**，两次并发恢复恰好一个成功。
+- **恢复内容**：文档、各修订标注、发布与批次关系、撤回记录及对应原图/成品
+  文件整体写入；ID、版本号、摘要与各类时间原样保留，本机文件路径按当前
+  `DATA_DIR` 重建；批次成员冗余字段取自对应发布记录。归档不包含批次幂等
+  键，`batch_idempotency` **不推断恢复**（旧键重放按新键处理）。
+- **全有或全无**：无效归档、非空实例、目标冲突、写盘失败
+  （`500 restore_file_write_failed`）或写库失败（`500 restore_write_failed`）
+  都明确拒绝——事务整体回滚并删除本次已落盘文件与新建目录，**不留可查询的
+  部分记录或本次文件**。成功 `200` 返回 `record_counts`（五类记录计数）与
+  `file_counts`（原图/成品文件数）；既有查询与公开接口随即按恢复记录及原
+  `publish_at`/撤回规则工作，修订号/版本号在恢复值上顺延。
+- 新增模块 `app/archive_restore.py`（纯解析恢复计划，无副作用）与测试
+  `tests/test_restore.py`（18 个用例）、示例 `examples/demo_restore.sh`；
+  新增配置项 `MAX_RESTORE_MB`。**不新增任何数据表或列**，上传、标注、发布
+  （含定时公开）、批次与幂等键、撤回、公开读取、离线交付包、服务数据归档
+  与核验的路由/请求/响应字段及启动方式（Docker Compose / uvicorn）全部保持
+  兼容。
+
+## 历史变动（服务数据归档核验）
 
 - 新增 `POST /service-data-archives/verify`：运维在交接前上传本服务生成的
   归档 ZIP（`multipart/form-data`，字段名 `file`）核验其**完整可信**。

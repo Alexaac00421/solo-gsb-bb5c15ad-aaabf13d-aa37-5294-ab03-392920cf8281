@@ -29,6 +29,12 @@ class Settings:
     max_verify_bytes: int = field(
         default_factory=lambda: _int_env("MAX_VERIFY_MB", 512) * 1024 * 1024
     )
+    # 归档恢复请求体大小上限（字节），由 MAX_RESTORE_MB 换算。
+    # 恢复同样先把上传 ZIP 落到系统临时目录（核验通过后才写入 DATA_DIR），
+    # 该上限用于约束内存/临时盘占用。
+    max_restore_bytes: int = field(
+        default_factory=lambda: _int_env("MAX_RESTORE_MB", 512) * 1024 * 1024
+    )
 
     @property
     def db_path(self) -> str:
