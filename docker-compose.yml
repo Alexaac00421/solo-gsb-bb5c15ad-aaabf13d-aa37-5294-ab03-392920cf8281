@@ -1,0 +1,15 @@
+services:
+  redaction-service:
+    build: .
+    image: archive-redaction-service
+    ports:
+      - "8000:8000"
+    environment:
+      DATA_DIR: /data
+      MAX_UPLOAD_MB: "25"
+    volumes:
+      - redaction-data:/data
+    restart: unless-stopped
+
+volumes:
+  redaction-data:
